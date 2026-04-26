@@ -202,7 +202,7 @@ static void delay_cycles(uint32_t cycles) {
 //-----------------------------------------------------------------------------
 static void led_task(void) {
   if (timer_expired_flg) {
-    PORT->Group[BL_LED_PORT].DIRTGL.reg = (1 << BL_LED_PIN);
+    PORT->Group[BL_LED_PORT].OUTTGL.reg = (1 << BL_LED_PIN);
   }
 }
 
@@ -327,12 +327,14 @@ static void uart_task(void) {
 //-----------------------------------------------------------------------------
 static void command_task(void) {
   if (BL_REQUEST != uart_buffer[0]) {
-    send_response(BL_RESP_ERROR);
+    send_response(BL_RESP_INVALID);
   } else if (BL_CMD_UNLOCK == uart_command) {
-    uint32_t begin = (uart_buffer[1] & ALIGN_MASK);
-    uint32_t end   = begin + (uart_buffer[2] & ALIGN_MASK);
+    uint32_t begin = uart_buffer[1];
+    uint32_t size  = uart_buffer[2];
+    uint32_t end   = begin + size;
     bool     pass =
-        (end > begin) &&
+        (begin == (begin & ALIGN_MASK)) && (size == (size & ALIGN_MASK)) &&
+        (end >= begin) && (end > begin) &&
         ((end <= FLASH_SIZE) ||
          (begin >= DATA_FLASH_ADDR &&
           end <= (DATA_FLASH_ADDR + DATA_FLASH_SIZE)) ||
@@ -351,7 +353,8 @@ static void command_task(void) {
   } else if (BL_CMD_DATA == uart_command) {
     flash_addr = uart_buffer[1];
 
-    if (unlock_begin <= flash_addr && flash_addr < unlock_end) {
+    if ((unlock_begin <= flash_addr) && ((flash_addr + DATA_SIZE) <= unlock_end) &&
+        ((flash_addr + DATA_SIZE) >= flash_addr)) {
       for (int i = 0; i < WORDS(DATA_SIZE); i++)
         flash_data[i] = uart_buffer[i + 2];
 
@@ -366,19 +369,23 @@ static void command_task(void) {
     uint32_t size = unlock_end - unlock_begin;
     uint32_t crc  = uart_buffer[1];
 
-    DSU->ADDR.reg    = addr;
-    DSU->LENGTH.reg  = size;
-    DSU->DATA.reg    = 0xffffffff;
-    DSU->STATUSA.reg = DSU->STATUSA.reg;
-    DSU->CTRL.reg    = DSU_CTRL_CRC;
+    if (unlock_end > unlock_begin) {
+      DSU->ADDR.reg    = addr;
+      DSU->LENGTH.reg  = size;
+      DSU->DATA.reg    = 0xffffffff;
+      DSU->STATUSA.reg = DSU->STATUSA.reg;
+      DSU->CTRL.reg    = DSU_CTRL_CRC;
 
-    while (0 == DSU->STATUSA.bit.DONE)
-      ;
+      while (0 == DSU->STATUSA.bit.DONE)
+        ;
 
-    if ((0 == DSU->STATUSA.bit.BERR) && (crc == DSU->DATA.reg))
-      send_response(BL_RESP_CRC_OK);
-    else
-      send_response(BL_RESP_CRC_FAIL);
+      if ((0 == DSU->STATUSA.bit.BERR) && (crc == DSU->DATA.reg))
+        send_response(BL_RESP_CRC_OK);
+      else
+        send_response(BL_RESP_CRC_FAIL);
+    } else {
+      send_response(BL_RESP_INVALID);
+    }
   } else if (BL_CMD_RESET == uart_command) {
     // Unrolling the loop here saves significant amount of Flash
     ram[0] = uart_buffer[1];

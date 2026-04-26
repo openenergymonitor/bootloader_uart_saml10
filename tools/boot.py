@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 *
 * \brief boot.py
@@ -21,15 +23,22 @@
 *
 """
 
-#!/usr/bin/env python
-
+import argparse
 import sys
 import time
-import serial
-import serial.tools.list_ports
-import optparse
+from pathlib import Path
 
-from rich.progress import Progress
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
+
+try:
+    from rich.progress import Progress
+except ImportError:  # Quiet mode should still work without rich.
+    Progress = None
+
 
 # ------------------------------------------------------------------------------
 # Bootloader commands
@@ -46,22 +55,35 @@ BL_RESP_CRC_OK = 0x53
 BL_RESP_CRC_FAIL = 0x54
 
 BOOTLOADER_SIZE = 1024
+PAGE_SIZE = 256
+GUARD_WORD = 0x2B620BC3
+RETRY_COUNT = 3
+RETRY_DELAY = 0.2
+BAUD_RATE = 115200
+SERIAL_TIMEOUT = 1
+REBOOT_PAYLOAD = bytes(16)
+
+RESPONSE_NAMES = {
+    BL_RESP_OK: "ok",
+    BL_RESP_ERROR: "error",
+    BL_RESP_INVALID: "invalid",
+    BL_RESP_CRC_OK: "crc-ok",
+    BL_RESP_CRC_FAIL: "crc-fail",
+}
 
 
-# ------------------------------------------------------------------------------
-def error(text):
-    sys.stderr.write(f"Error: {text}\n")
-    sys.exit(1)
+class BootError(Exception):
+    pass
 
 
 # ------------------------------------------------------------------------------
 def warning(text):
-    sys.stderr.write("Warning: {text}\n")
+    sys.stderr.write(f"Warning: {text}\n")
 
 
 # ------------------------------------------------------------------------------
-def verbose(verb, text, nl=True):
-    if verb:
+def verbose(enabled, text, nl=True):
+    if enabled:
         if nl:
             print(text)
         else:
@@ -75,15 +97,18 @@ def crc32_tab_gen():
     for i in range(256):
         value = i
 
-        for j in range(8):
+        for _ in range(8):
             if value & 1:
                 value = (value >> 1) ^ 0xEDB88320
             else:
-                value = value >> 1
+                value >>= 1
 
-        res += [value]
+        res.append(value)
 
     return res
+
+
+CRC32_TABLE = crc32_tab_gen()
 
 
 # ------------------------------------------------------------------------------
@@ -97,180 +122,272 @@ def crc32(tab, data):
 
 
 # ------------------------------------------------------------------------------
-def uint32(v):
-    return [(v >> 0) & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]
+def uint32(value):
+    return value.to_bytes(4, byteorder="little", signed=False)
 
 
 # ------------------------------------------------------------------------------
-def get_response(port):
-    v = port.read()
-
-    if len(v) == 0:
-        return None
-    elif len(v) > 1:
-        error("Invalid response received (size > 1)")
-
-    return v[0]
-
-
-# ------------------------------------------------------------------------------
-def send_request(port, cmd, data):
-    req = [cmd] + uint32(0x2B620BC3) + data
-
-    for i in range(3):
-        port.write(bytes(req))
-        resp = get_response(port)
-
-        if resp is None:
-            warning(f"No response received, retrying {(i + 1)}")
-            time.sleep(0.2)
-        else:
-            return resp
-
-    error("No response received, giving up")
-
-
-# ------------------------------------------------------------------------------
-def upload(options, port, offset):
+def parse_offset(text):
     try:
-        data = data = [x for x in open(options.file, "rb").read()]
-    except Exception as inst:
-        error(inst)
+        return int(text, 0)
+    except ValueError as inst:
+        raise BootError(f"Invalid offset value: {text}") from inst
 
-    while len(data) % 256 > 0:
-        data += [0xFF]
 
-    crc32_tab = crc32_tab_gen()
-    crc = crc32(crc32_tab, data)
+# ------------------------------------------------------------------------------
+def pad_file_data(data):
+    remainder = len(data) % PAGE_SIZE
+    if remainder != 0:
+        data.extend(b"\xFF" * (PAGE_SIZE - remainder))
+    return data
 
-    size = len(data)
 
-    verbose(options.verbose, "Unlocking")
-    resp = send_request(port, BL_CMD_UNLOCK, uint32(offset) + uint32(size))
+# ------------------------------------------------------------------------------
+def iter_blocks(data):
+    for start in range(0, len(data), PAGE_SIZE):
+        yield data[start : start + PAGE_SIZE]
 
-    if resp != BL_RESP_OK:
-        error(
-            "Invalid response code (0x%02x). Check that your file size and offset are correct."
-            % resp
+
+# ------------------------------------------------------------------------------
+def list_ports():
+    if serial is None:
+        raise BootError("pyserial is required to list serial ports")
+
+    print("Available ports:")
+    for comport in serial.tools.list_ports.comports():
+        print("  -", comport.device)
+
+
+# ------------------------------------------------------------------------------
+def response_name(resp):
+    return RESPONSE_NAMES.get(resp, f"unknown(0x{resp:02x})")
+
+
+# ------------------------------------------------------------------------------
+def ensure_response(resp, expected, context):
+    if resp == expected:
+        return
+
+    if context:
+        raise BootError(
+            f"{context} Received bootloader response {response_name(resp)} (0x{resp:02x})."
         )
 
-    blocks = [data[i : i + 256] for i in range(0, len(data), 256)]
-
-    verbose(
-        options.verbose,
-        "Uploading %d blocks at offset %d (0x%x)" % (len(blocks), offset, offset),
+    raise BootError(
+        f"Unexpected bootloader response {response_name(resp)} (0x{resp:02x})."
     )
-
-    addr = offset
-
-    if options.verbose:
-        with Progress() as p:
-            t = p.add_task("Uploading...", total=len(blocks))
-            while not p.finished and resp == BL_RESP_OK:
-                for idx, blk in enumerate(blocks):
-                    p.update(t, advance=1)
-                    resp = send_request(port, BL_CMD_DATA, uint32(addr) + blk)
-                    addr += 256
-
-                    if resp != BL_RESP_OK:
-                        break
-
-        if resp != BL_RESP_OK:
-            error("Invalid response code (0x%02x)" % resp)
-
-    else:
-        for idx, blk in enumerate(blocks):
-            resp = send_request(port, BL_CMD_DATA, uint32(addr) + blk)
-            addr += 256
-
-            if resp != BL_RESP_OK:
-                error("Invalid response code (0x%02x)" % resp)
-
-    verbose(options.verbose, "Verification", nl=False)
-    resp = send_request(port, BL_CMD_VERIFY, uint32(crc))
-
-    if resp == BL_RESP_CRC_OK:
-        verbose(options.verbose, "... success")
-    else:
-        error("... fail (status = 0x%02x)" % resp)
 
 
 # ------------------------------------------------------------------------------
-def main():
-    parser = optparse.OptionParser(
+def read_binary_file(path):
+    try:
+        return bytearray(Path(path).read_bytes())
+    except OSError as inst:
+        raise BootError(inst) from inst
+
+
+# ------------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
         prog="boot.py",
         description="This program loads a binary file through UART to a SAML10 with bootloader.",
         epilog="github.com/awjlogan/bootloader_uart_saml10",
     )
-    parser.add_option(
+    parser.add_argument(
         "-v",
         "--verbose",
-        dest="verbose",
         help="enable verbose output",
-        default=False,
         action="store_true",
     )
-    parser.add_option(
+    parser.add_argument(
+        "--list-ports",
+        help="list available communication ports and exit",
+        action="store_true",
+    )
+    parser.add_argument(
         "-i", "--interface", dest="port", help="Communication interface", metavar="PATH"
     )
-    parser.add_option(
+    parser.add_argument(
         "-f", "--file", dest="file", help="Binary file to program", metavar="FILE"
     )
-    parser.add_option(
+    parser.add_argument(
         "-o",
         "--offset",
-        dest="offset",
         help="Destination offset (default 0x400)",
         default="0x400",
         metavar="OFFS",
     )
-    parser.add_option(
+    parser.add_argument(
         "-r",
         "--reboot",
-        dest="reboot",
         help="send the reboot command",
-        default=False,
         action="store_true",
     )
-    parser.add_option(
-        "",
+    parser.add_argument(
         "--boot",
-        dest="boot",
         help="Enable write to the bootloader area",
-        default=False,
         action="store_true",
     )
-    (options, args) = parser.parse_args()
+    return parser
 
-    if not options.port:
-        print("Available ports:")
-        for comport in serial.tools.list_ports.comports():
-            print("  - ", comport.device)
-        error("Communication port is required.")
 
-    try:
-        offset = int(options.offset, 0)
-    except ValueError:
-        error("Invalid offset value: %s" % options.offset)
+class BootloaderClient:
+    def __init__(self, port):
+        self.port = port
 
-    if (offset < BOOTLOADER_SIZE) and not options.boot:
-        error(
-            "Offset is within the bootloader area, use --boot options to unlock writes"
+    def get_response(self):
+        response = self.port.read()
+
+        if len(response) == 0:
+            return None
+        if len(response) > 1:
+            raise BootError("Invalid response received (size > 1)")
+        if response[0] not in RESPONSE_NAMES:
+            raise BootError(f"Unknown response byte: 0x{response[0]:02x}")
+
+        return response[0]
+
+    def send_request(self, command, data):
+        request = bytes([command]) + uint32(GUARD_WORD) + bytes(data)
+
+        for attempt in range(1, RETRY_COUNT + 1):
+            try:
+                self.port.write(request)
+                response = self.get_response()
+            except serial.serialutil.SerialException as inst:
+                raise BootError(inst) from inst
+
+            if response is not None:
+                return response
+
+            warning(f"No response received, retrying {attempt}")
+            time.sleep(RETRY_DELAY)
+
+        raise BootError("No response received, giving up")
+
+    def upload(self, options, offset):
+        data = pad_file_data(read_binary_file(options.file))
+        size = len(data)
+        checksum = crc32(CRC32_TABLE, data)
+
+        verbose(options.verbose, "Unlocking")
+        response = self.send_request(
+            BL_CMD_UNLOCK,
+            uint32(offset) + uint32(size),
+        )
+        ensure_response(
+            response,
+            BL_RESP_OK,
+            "Bootloader rejected unlock request. Check the file size and offset.",
         )
 
-    try:
-        port = serial.Serial(options.port, 115200, timeout=1)
-    except serial.serialutil.SerialException as inst:
-        error(inst)
-    else:
-        with port:
-            if options.file is not None:
-                upload(options, port, offset)
-            if options.reboot:
-                verbose(options.verbose, "Rebooting")
-                send_request(port, BL_CMD_RESET, uint32(0) * 4)
+        self.send_blocks(options, data, offset)
 
-        verbose(options.verbose, "Done!")
+        verbose(options.verbose, "Verification", nl=False)
+        response = self.send_request(BL_CMD_VERIFY, uint32(checksum))
+        ensure_response(response, BL_RESP_CRC_OK, "CRC verification failed.")
+
+        if options.verbose:
+            print("... success")
+
+    def send_blocks(self, options, data, offset):
+        total_blocks = len(data) // PAGE_SIZE
+        verbose(
+            options.verbose,
+            "Uploading %d blocks at offset %d (0x%x)" % (total_blocks, offset, offset),
+        )
+
+        payload = bytearray(4 + PAGE_SIZE)
+        payload[:4] = uint32(offset)
+
+        progress = None
+        task = None
+
+        if options.verbose and Progress is not None:
+            progress = Progress()
+            progress.start()
+            task = progress.add_task("Uploading...", total=total_blocks)
+        elif options.verbose and Progress is None:
+            warning("rich is not installed; falling back to simple verbose output")
+
+        try:
+            for index, block in enumerate(iter_blocks(data), start=1):
+                addr = offset + ((index - 1) * PAGE_SIZE)
+                payload[:4] = uint32(addr)
+                payload[4:] = block
+
+                response = self.send_request(BL_CMD_DATA, payload)
+                ensure_response(response, BL_RESP_OK, "Bootloader rejected page write.")
+
+                if progress is not None:
+                    progress.update(task, advance=1)
+                elif options.verbose:
+                    print(f"  wrote block {index}/{total_blocks}")
+        finally:
+            if progress is not None:
+                progress.stop()
+
+    def reboot(self, options):
+        verbose(options.verbose, "Rebooting")
+        response = self.send_request(BL_CMD_RESET, REBOOT_PAYLOAD)
+        ensure_response(response, BL_RESP_OK, "Bootloader rejected reset request.")
+
+
+# ------------------------------------------------------------------------------
+def validate_options(options):
+    if options.list_ports:
+        return
+
+    if not options.port:
+        raise BootError("Communication port is required. Use --list-ports to discover devices.")
+
+    if options.file is None and not options.reboot:
+        raise BootError("Nothing to do. Provide --file and/or --reboot.")
+
+    offset = parse_offset(options.offset)
+
+    if (offset < BOOTLOADER_SIZE) and not options.boot:
+        raise BootError("Offset is within the bootloader area, use --boot to unlock writes")
+
+    return offset
+
+
+# ------------------------------------------------------------------------------
+def run(options):
+    if options.list_ports:
+        list_ports()
+        return
+
+    offset = validate_options(options)
+
+    if serial is None:
+        raise BootError("pyserial is required to use the bootloader tool")
+
+    try:
+        port = serial.Serial(options.port, BAUD_RATE, timeout=SERIAL_TIMEOUT)
+    except serial.serialutil.SerialException as inst:
+        raise BootError(inst) from inst
+
+    with port:
+        client = BootloaderClient(port)
+        if options.file is not None:
+            client.upload(options, offset)
+        if options.reboot:
+            client.reboot(options)
+
+    verbose(options.verbose, "Done!")
+
+
+# ------------------------------------------------------------------------------
+def main():
+    parser = build_parser()
+    options = parser.parse_args()
+
+    try:
+        run(options)
+    except BootError as inst:
+        sys.stderr.write(f"Error: {inst}\n")
+        sys.exit(1)
 
 
 # ------------------------------------------------------------------------------
