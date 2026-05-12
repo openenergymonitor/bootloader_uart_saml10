@@ -49,6 +49,8 @@ python3 boot.py -v -i SERIAL_PORT -r
 
 This first loads the firmware and then resets the device. If the BOOT pin is not pulled LOW, the SAML10 will enter the application.
 
+The error `Error: Unknown response byte: 0xbf` means three's an issue with the UART connection or the device is not in bootloader mode
+
 If you need to list your available `SERIAL_PORT`s, simply run `python3 boot.py`.
 
 ### Troubleshooting
