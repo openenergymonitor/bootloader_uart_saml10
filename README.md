@@ -47,7 +47,17 @@ python3 boot.py -v -i SERIAL_PORT -f PATH_TO_BIN -o 0x400
 python3 boot.py -v -i SERIAL_PORT -r
 ```
 
-This first loads the firmware and then resets the device. If the BOOT pin is not pulled LOW, the SAML10 will enter the application.
+This first loads the firmware and then resets the device. If the BOOT pin is not pulled LOW, the SAML10 will enter the application. 
+
+Succesful upload responce:
+
+```
+Unlocking
+Uploading 67 blocks at offset 1024 (0x400)
+Uploading... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:00:00
+Verification... success
+Done!
+```
 
 The error `Error: Unknown response byte: 0xbf` means three's an issue with the UART connection or the device is not in bootloader mode
 
